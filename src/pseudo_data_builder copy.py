@@ -48,7 +48,7 @@ def matching_highlights(articles, summaries, highlight_positions):
     '''
     results = []
     for i, _ in enumerate(highlight_positions):
-        tmp_highlights, tmp_positions = [[] for i in range(len(_))], []
+        tmp_highlights, tmp_positions = [[] for ii in range(len(_))], []
         for j, __ in enumerate(_):
             tmptmp_positions = [int(___) for ___ in __.split(',') if ___ != '']
             tmp_positions.append(tmptmp_positions)
@@ -78,7 +78,8 @@ def text_processing(data, mode = ['ner'], types = ['summary', 'highlight', 'arti
     disable_mode = [_ for _ in ["tagger", "parser", "ner"] if _ not in mode]
     results = []
 
-    ## break down texts into a single list ["...", '...', ...]
+    ## merge texts into a single list ["...", '...', ...]
+    ## merging is for quick processing of spacy
     all_summaries, all_highlights, summary_lengths = [], [], []
     if 'article' in types:
         all_articles, article_lengths = [], [] 
@@ -97,7 +98,7 @@ def text_processing(data, mode = ['ner'], types = ['summary', 'highlight', 'arti
     if 'article' in types:
         all_articles_ner = list(nlp.pipe(all_articles, disable=disable_mode))
     
-    ## un-break-down lists of texts into aligned format
+    ## break lists of texts into aligned format
     summary_index, highlight_index, article_index = 0, 0, 0
     for i, _ in enumerate(data):
         assert len(_['highlight_position']) == summary_lengths[i]
@@ -135,7 +136,9 @@ def load_ner_data(file_path):
     logger.info('Loading data {}'.format(file_path))
     with open(file_path, 'rb') as f:
         tagged_data = pickle.loads(f.read())
-    logger.info('Successfully loaded data {}'.format(file_path))
+    logger.info('Successfully loaded data {}, which contains {} samples'.format(file_path, len(tagged_data)))
+    logger.info(tagged_data[0]['summary'])
+    logger.info(tagged_data[0]['highlight'])
     return tagged_data
 
 def get_entity(doc, offset = 0, number_type = ['DATE', 'TIME', 'PERCENT', 'MONEY', 'QUANTITY', 'ORDINAL', 'CARDINAL']):
@@ -271,6 +274,9 @@ def classifying_overlap(entity_text, hypothesis_instances, entity_type, allowed_
 def swap_name_entity(sentence_text, sent_instances, ops = None, prob = 0.5, hypothesis_instances = None):
     '''
     to swap two name entities inside a sentence
+    ## new change on 2020/May/01:
+            not swap any more. 
+            Current: to change a entity in gold summary with a random entity from highlight text
 
     Args:
         sentence_text: a list of tokens
@@ -283,6 +289,7 @@ def swap_name_entity(sentence_text, sent_instances, ops = None, prob = 0.5, hypo
         operations: produce operations to adjust positions
     '''
 
+    # for debugging
     # if 'Minatel' in sentence_text: 
     #     logger.info(sentence_text)
     #     logger.info(sent_instances)
@@ -332,17 +339,26 @@ def swap_name_entity(sentence_text, sent_instances, ops = None, prob = 0.5, hypo
             # swap_pair = [sent_instances[swap_pair_indexes[0]], sent_instances[swap_pair_indexes[1]]]
             # if swap_pair[0]['offset_position'][0] < swap_pair[1]['offset_position'][0]:
             #     swap_pair[0], swap_pair[1] = swap_pair[1], swap_pair[0]
-            sentence_text = del_and_insert(sentence_text, swap_pair[1]['text'], swap_pair[0]['offset_position'])
-            sentence_text = del_and_insert(sentence_text, swap_pair[0]['text'], swap_pair[1]['offset_position'])
+            if random.random() <= prob:
+                sentence_text = del_and_insert(sentence_text, swap_pair[1]['text'], swap_pair[0]['offset_position'])
+                sentence_text = del_and_insert(sentence_text, swap_pair[0]['text'], swap_pair[1]['offset_position'])
+                operations.append([swap_pair[0]['offset_position'], swap_pair[1]['offset_position']])
+            elif random.random() <= prob:
+                sentence_text = del_and_insert(sentence_text, swap_pair[1]['text'], swap_pair[0]['offset_position'])
+                operations.append([swap_pair[0]['offset_position'], (swap_pair[1]['offset_position'][1]-swap_pair[1]['offset_position'][1][0])])
+            else:
+                sentence_text = del_and_insert(sentence_text, swap_pair[0]['text'], swap_pair[1]['offset_position'])
+                operations.append([swap_pair[1]['offset_position'], (swap_pair[0]['offset_position'][1]-swap_pair[0]['offset_position'][1][0])])
+
             del sent_instances[swap_pair_indexes[0]]
             if swap_pair_indexes[0] < swap_pair_indexes[1]: 
                 del sent_instances[swap_pair_indexes[1] - 1]
             else:
                 del sent_instances[swap_pair_indexes[1]]
-            operations.append([swap_pair[0]['offset_position'], swap_pair[1]['offset_position']])
+
             for j in range(len(sent_instances)):
                 try:
-                    sent_instances[j]['offset_position'] = adjust_position(sent_instances[j]['offset_position'], [swap_pair[0]['offset_position'], swap_pair[1]['offset_position']])
+                    sent_instances[j]['offset_position'] = adjust_position(sent_instances[j]['offset_position'], operations[-1])
                 except ValueError:
                     logger.info(sentence_text)
                     logger.info(sent_instances)
@@ -622,9 +638,20 @@ def main_func(tagged_data, use_single_summ_sentence = False, mode = 'classifier'
     for i, _ in enumerate(tagged_data): 
         for j, __ in enumerate(_['highlight']):
             if use_single_summ_sentence:
-                temp_sample = pseudo_data_algorithm(__, hypothesis=_['summary'][j], number_vocab=number_vocab)
+                # 1.
+                # make change to gold summary
+                # temp_sample = pseudo_data_algorithm(__, hypothesis=_['summary'][j], number_vocab=number_vocab)
+                # 2.
+                # make change to highlight sentence (extrtactive sentence)
+                temp_sample = pseudo_data_algorithm(_['summary'][j], hypothesis=__, number_vocab=number_vocab)
             else:
-                temp_sample = pseudo_data_algorithm(__, hypothesis=_['summary'], number_vocab=number_vocab)
+                # 1. 
+                # make change to gold summary
+                # temp_sample = pseudo_data_algorithm(__, hypothesis=_['summary'], number_vocab=number_vocab)
+                # 3.
+                # make change to highlight sentence (extrtactive sentence)
+                temp_sample = pseudo_data_algorithm(_['summary'][j], hypothesis=_['highlight'], number_vocab=number_vocab)
+
             temp_count = 0
             for signal in temp_sample['signal']:
                 if signal:
@@ -655,8 +682,8 @@ def main_func(tagged_data, use_single_summ_sentence = False, mode = 'classifier'
             elif mode == 'lev_transformer': 
                 if temp_count >= 2: 
                     # pseudo_highlights.append(temp_sample)
-                    src_samples.append('[CLS] ' + ' '.join(temp_sample['text']) + ' [SEP] ' + ' '.join(temp_sample['ref']))
-                    tgt_samples.append('[CLS] ' + ' '.join(temp_sample['original']) + ' [SEP] ' + ' '.join(temp_sample['ref']))
+                    src_samples.append('[CLS] ' + ' '.join(temp_sample['ref']) + ' [SEP] ' + ' '.join(temp_sample['text']))
+                    tgt_samples.append('[CLS] ' + ' '.join(temp_sample['ref']) + ' [SEP] ' + ' '.join(temp_sample['original']))
                     data_statistic[-1] += 1
                     # if random.random() <= 0.2:   
                     #     ## 20% of the two-signal samples are also saved as positive
@@ -668,8 +695,8 @@ def main_func(tagged_data, use_single_summ_sentence = False, mode = 'classifier'
                 elif temp_count >= 1 and random.random() <= 0.15: 
                         # 15% of the one-signal data are positive
                         # pseudo_highlights.append(temp_sample)
-                        src_samples.append('[CLS] ' + ' '.join(temp_sample['text']) + ' [SEP] ' + ' '.join(temp_sample['ref']))
-                        tgt_samples.append('[CLS] ' + ' '.join(temp_sample['original']) + ' [SEP] ' + ' '.join(temp_sample['ref']))
+                        src_samples.append('[CLS] ' + ' '.join(temp_sample['ref']) + ' [SEP] ' + ' '.join(temp_sample['text']))
+                        tgt_samples.append('[CLS] ' + ' '.join(temp_sample['ref']) + ' [SEP] ' + ' '.join(temp_sample['original']))
                         data_statistic[-1] += 1
                 if random.random() <= 0.1: 
                     # 10% of all data are positive
@@ -677,8 +704,8 @@ def main_func(tagged_data, use_single_summ_sentence = False, mode = 'classifier'
                     _temp_sample['label'] = 0
                     _temp_sample['text'] = temp_sample['original']
                     # pseudo_highlights.append(_temp_sample)
-                    src_samples.append('[CLS] ' + ' '.join(_temp_sample['text']) + ' [SEP] ' + ' '.join(_temp_sample['ref']))
-                    tgt_samples.append('[CLS] ' + ' '.join(_temp_sample['original']) + ' [SEP] ' + ' '.join(_temp_sample['ref']))
+                    src_samples.append('[CLS] ' + ' '.join(_temp_sample['ref']) + ' [SEP] ' + ' '.join(_temp_sample['text']))
+                    tgt_samples.append('[CLS] ' + ' '.join(_temp_sample['ref']) + ' [SEP] ' + ' '.join(_temp_sample['original']))
                     # positive++
                     data_statistic[-2] += 1 
             
@@ -691,7 +718,8 @@ if __name__ == '__main__':
     # parser.add_argument('-article_path', required=True, help='article tsv file path')
     # parser.add_argument('-summ_path', required=True, help='summaries tsv file path')
     # parser.add_argument('-highlight_path', required=True, help='highlight tsv file path')
-    parser.add_argument('-file_path', default='/data/senyang/nli_summarization/summarization-sing-pair-mix/processed/cnn_dm/', help='folder path of the input files')
+    parser.add_argument('-file_path', default='/data/senyang/summ_consistence/spacy_ner_data/', help='folder path of the input files')
+    parser.add_argument('-save_path', default='/data/senyang/summ_consistence/spacy_ner_data_mask/', help='folder path of the output files')
     parser.add_argument('-mode', required=True, help='train, val or test')
     parser.add_argument('-chunk_size', default=20000, type=int, help='output file max size')
     parser.add_argument('-lev_true', action='store_true', default=False, help='whether for lev_transformer data')
@@ -724,7 +752,7 @@ if __name__ == '__main__':
                 pseudo_data, data_statistic = main_func(tagged_data)
                 for p, _ in enumerate( data_statistic):
                     pseudo_data_statistic[p] += _
-                with open(args.file_path + args.mode +'/pseudo_data/pseudo_data_{}.pkl'.format(i), 'wb') as f:
+                with open(args.save_path + args.mode +'/pseudo_data/pseudo_data_{}.pkl'.format(i), 'wb') as f:
                     pickle.dump(pseudo_data, f, protocol=3)
                 logger.info('Builded {} samples. Successfully saved pseudo_data_{}.pkl'.format(len(pseudo_data), i))
         elif args.mode in {'val', 'test'}: 
@@ -733,7 +761,7 @@ if __name__ == '__main__':
             pseudo_data, data_statistic = main_func(tagged_data)
             for p, _ in enumerate( data_statistic):
                 pseudo_data_statistic[p] += _
-            with open(args.file_path + args.mode +'/pseudo_data.pkl', 'wb') as f:
+            with open(args.save_path + args.mode +'/pseudo_data.pkl', 'wb') as f:
                 pickle.dump(pseudo_data, f, protocol=3)
             logger.info('Builded {} samples. Successfully saved pseudo_data.pkl.'.format(len(pseudo_data)))
     else: 
@@ -752,11 +780,11 @@ if __name__ == '__main__':
                     pseudo_data_statistic[p] += _
                 logger.info('Builded the {}_th chunk. '.format(i))
             logger.info('Start writing source file. ')
-            with open(args.file_path + args.mode +'.src-tgt.src', 'w', encoding='utf-8') as f:
+            with open(args.save_path + args.mode +'.src-tgt.src', 'w', encoding='utf-8') as f:
                 for _ in src: 
                     f.write(_ + '\n')
             logger.info('Start writing target file. ')
-            with open(args.file_path + args.mode +'.src-tgt.tgt', 'w', encoding='utf-8') as f:
+            with open(args.save_path + args.mode +'.src-tgt.tgt', 'w', encoding='utf-8') as f:
                 for _ in tgt: 
                     f.write(_ + '\n')
                 
@@ -767,11 +795,11 @@ if __name__ == '__main__':
             for p, _ in enumerate( data_statistic):
                 pseudo_data_statistic[p] += _
             logger.info('Start writing source file. ')
-            with open(args.file_path + args.mode +'.src-tgt.src', 'w', encoding='utf-8') as f:
+            with open(args.save_path + args.mode +'.src-tgt.src', 'w', encoding='utf-8') as f:
                 for _ in src: 
                     f.write(_ + '\n')
             logger.info('Start writing target file. ')
-            with open(args.file_path + args.mode +'.src-tgt.tgt', 'w', encoding='utf-8') as f:
+            with open(args.save_path + args.mode +'.src-tgt.tgt', 'w', encoding='utf-8') as f:
                 for _ in tgt: 
                     f.write(_ + '\n')
     
