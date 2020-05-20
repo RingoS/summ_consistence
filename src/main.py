@@ -25,19 +25,18 @@ This script is modified based on transformers/examples/run_language_modeling.py
 
 import torch
 import torch.nn as nn
-import models
 import random, os, numpy as np
 import argparse
 import csv
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader
-import copy
+import copy, time, pickle
 
 import logging
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Optional, Any, Dict, List, NewType, Tuple
+from typing import Optional, Any, Dict, List, NewType, Tuple, Callable, NamedTuple
 
 from transformers import (
     CONFIG_MAPPING,
@@ -55,31 +54,20 @@ from transformers import (
     set_seed,
 )
 
-from transformers import DataCollator
+from transformers import DataCollator, PreTrainedModel, EvalPrediction, DefaultDataCollator
+from tqdm.auto import tqdm, trange
 
-# #*****************************************************************
-# '''
-# set random seed
-# '''
-# seed = 42
-# random.seed(seed)
-# os.environ['PYTHONHASHSEED']  =  str(seed)
-# np.random.seed(seed)
-# torch.manual_seed(seed)
-# torch.cuda.manual_seed(seed)
-# torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
-# torch.backends.cudnn.benchmark  =  False
-# torch.backends.cudnn.deterministic  =  True
-# def _init_fn(worker_id):
-#     ''' for dataloader workers init,  freeze dataloader's randomness '''
-#     np.random.seed(seed + worker_id)
-# #******************************************************************
+from models import BertForTextEditing, EncoderDecoderInsertionModel
+from trainer_for_factual_editing import TrainerForFactualEditing, torch_distributed_zero_first
 
 logger = logging.getLogger(__name__)
 
-
 MODEL_CONFIG_CLASSES = list(MODEL_WITH_LM_HEAD_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
+# label ids for sequence labeling (to label tokens with factual inconsistencies)
+sequence_labeling_label_ids = [0, 1, 2]  # [O, B, I]
+pad_token_label_id = -100
 
 
 @dataclass
@@ -107,7 +95,12 @@ class ModelArguments:
     cache_dir: Optional[str] = field(
         default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
     )
-
+    share_bert_param: bool = field(
+        default=False, metadata={"help": "Whether the two BERTs (for classification/generation, respectively) share parameters"}
+    )
+    classify_or_insertion: str = field(
+        default='classify', metadata={"help": "to do sequence labeling or seq2seq insertion"}
+    )
 
 @dataclass
 class DataTrainingArguments:
@@ -146,7 +139,6 @@ class DataTrainingArguments:
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
     )
 
-
 def get_dataset(args: DataTrainingArguments, tokenizer: PreTrainedTokenizer, evaluate=False, local_rank=-1):
     file_path = args.eval_data_file if evaluate else args.train_data_file
     # if args.line_by_line:
@@ -167,146 +159,377 @@ class CsvDataset(Dataset):
     soon.
     """
 
-    def __init__(self, tokenizer: PreTrainedTokenizer, file_path: str, block_size: int, local_rank=-1):
+    def __init__(self, tokenizer: PreTrainedTokenizer, file_path: str, block_size: int, local_rank=-1, overwrite_cache=False):
         assert os.path.isfile(file_path)
         # Here, we do not cache the features, operating under the assumption
         # that we will soon use fast multithreaded tokenizers from the
         # `tokenizers` repo everywhere =)
         self.tokenizer = tokenizer
-        logger.info("Creating features from dataset file at %s", file_path)
 
-        csv_data = self.read_csv(file_path)
+        if 'only_mask' in file_path: 
+            block_size = block_size - tokenizer.num_special_tokens_to_add(pair=False)
 
-        # with open(file_path, encoding="utf-8") as f:
-        #     lines = [line for line in f.read().splitlines() if (len(line) > 0 and not line.isspace())]
+        directory, filename = os.path.split(file_path)
+        cached_features_file = os.path.join(
+            directory, "cached_input_feature_{}_{}_{}".format(tokenizer.__class__.__name__, str(block_size), filename.replace('csv', 'pkl'),),
+        )
 
-        logger.info('Finishing reading csv file.')
+        with torch_distributed_zero_first(local_rank):
+            # Make sure only the first process in distributed training processes the dataset,
+            # and the others will use the cache.
 
-        # lines = [' '.join(_['text']) for _ in csv_data]  # for un-separated sentences
-        lines = [(' '.join(_['text1']), ' '.join(_['text2'])) for _ in csv_data]
-        original_masked_ids = tokenizer.batch_encode_plus(lines, add_special_tokens=True, max_length=block_size)["input_ids"]
-        logger.info('Finishing encoding original masked tokens.')
+            # load only_mask data file
+            if 'only_mask' in filename:
+                if os.path.exists(cached_features_file) and not overwrite_cache:
+                    start = time.time()
+                    with open(cached_features_file, "rb") as handle:
+                        self.examples, self.labels, self.gold_ids, self.entity_positions = pickle.load(handle)
+                    logger.info(
+                        f"Loading features from cached file {cached_features_file} [took %.3f s]", time.time() - start
+                    )
 
-        # replace [MASK] tokens with original tokens
-        gold_lines = []
-        entity_ids = []
-        consecutive_entity_positions = []
-        for _ in csv_data:
-            tmp_line = _['text2']
-            # sep_position = _['text'].index('[SEP]') + 1
-            # sep_position = _['text'].index('[SEP]')
-            _['entity'].sort(key=lambda x:x['position'][0])
-            entity_ids.append([tokenizer.encode(' '.join(__['text']), add_special_tokens=False) for __ in _['entity']])
-            consecutive_entity_positions.append([])
-            for j, __ in enumerate(_['entity']):
-                # for later processing
-                if (j != len(_['entity']) - 1) and (_['entity'][j]['position'][1] == _['entity'][j+1]['position'][0]):
-                    consecutive_entity_positions[-1].append(j+1)
-
-                del tmp_line[__['position'][0]: __['position'][1]]
-                for i in range(__['position'][0], __['position'][1]): 
-                    tmp_line.insert(i, __['text'][i-__['position'][0]])
-            gold_lines.append((' '.join(_['text1']), ' '.join(tmp_line)))
-        logger.info('Finishing preprocessing gold_lines.')
-
-        batch_encoding = tokenizer.batch_encode_plus(gold_lines, add_special_tokens=True, max_length=block_size)
-        logger.info('Finishing encoding gold_lines.')
-
-        self.examples = batch_encoding["input_ids"]
-        self.labels = copy.deepcopy(self.examples)
-        for _ in self.labels:
-            for __ in _:
-                __ = -100
-        logger.info('Finishing preprocessing labels.')
-
-        # func = lambda x, y, z : self.final_processing(x, y, z)
-        for i, _ in enumerate(self.examples):
-            tmp_count = 0
-            tmp_intervals = [0]
-            sep_position = _.index(self.tokenizer.sep_token_id)
-            
-            # try: 
-            #     sep_position = _.index(tokenizer.sep_token_id)
-            # except ValueError:
-            #     print(i)
-            #     print(tokenizer.convert_ids_to_tokens(_))
-            #     raise KeyboardInterrupt
-            j = sep_position + 1
-
-            mask_signal = False
-            while j < len(original_masked_ids[i]): 
-                if not mask_signal:
-                    if original_masked_ids[i][j] != tokenizer.mask_token_id:
-                        tmp_intervals[-1] += 1
-                    else:
-                        mask_signal = True
-                        # tmp_intervals.append(0)
-                        # logger.info('zzzz{}'.format(j))
                 else:
-                    if original_masked_ids[i][j] != tokenizer.mask_token_id:
+                    logger.info("Creating features from dataset file at %s", file_path)
+
+                    csv_data = self.read_csv(file_path)
+                    
+                    logger.info('Finishing reading csv file.')
+
+                    # lines = [' '.join(_['text']) for _ in csv_data]  # for un-separated sentences
+                    lines = [(' '.join(_['text1']), ' '.join(_['text2'])) for _ in csv_data]
+                    original_masked_ids = tokenizer.batch_encode_plus(lines, add_special_tokens=True, max_length=block_size)["input_ids"]
+                    logger.info('Finishing encoding original masked tokens.')
+
+                    # replace [MASK] tokens with original gold tokens
+                    gold_lines = []
+                    entity_ids = []
+                    consecutive_entity_positions = []
+                    for _ in csv_data:
+                        tmp_line = _['text2']
+                        # sep_position = _['text'].index('[SEP]') + 1
+                        # sep_position = _['text'].index('[SEP]')
+                        _['entity'].sort(key=lambda x:x['position'][0])
+                        entity_ids.append([tokenizer.encode(' '.join(__['text']), add_special_tokens=False) for __ in _['entity']])
+                        consecutive_entity_positions.append([])
+                        for j, __ in enumerate(_['entity']):
+                            # for later processing
+                            if (j != len(_['entity']) - 1) and (_['entity'][j]['position'][1] == _['entity'][j+1]['position'][0]):
+                                consecutive_entity_positions[-1].append(j+1)
+
+                            del tmp_line[__['position'][0]: __['position'][1]]
+                            for i in range(__['position'][0], __['position'][1]): 
+                                tmp_line.insert(i, __['text'][i-__['position'][0]])
+                        gold_lines.append((' '.join(_['text1']), ' '.join(tmp_line)))
+                    logger.info('Finishing preprocessing gold_lines.')
+
+                    batch_encoding = tokenizer.batch_encode_plus(gold_lines, add_special_tokens=True, max_length=block_size)
+                    logger.info('Finishing encoding gold_lines.')
+
+                    self.gold_ids = batch_encoding["input_ids"]
+                    self.examples = copy.deepcopy(self.gold_ids)
+                    self.labels = copy.deepcopy(self.examples)
+                    for i in range(len(self.labels)):
+                        for j in range(len(self.labels[i])):
+                            self.labels[i][j] = -100
+                    logger.info('Finishing preprocessing labels.')
+
+                    # func = lambda x, y, z : self.final_processing(x, y, z)
+                    entity_positions = []
+                    for i, _ in enumerate(self.examples):
+                        tmp_count = 0
+                        tmp_intervals = [0]
+                        sep_position = _.index(self.tokenizer.sep_token_id)
+                        
+                        # try: 
+                        #     sep_position = _.index(tokenizer.sep_token_id)
+                        # except ValueError:
+                        #     print(i)
+                        #     print(tokenizer.convert_ids_to_tokens(_))
+                        #     raise KeyboardInterrupt
+                        j = sep_position + 1
+
                         mask_signal = False
-                        tmp_intervals.append(1)
-                    # else:
-                    #     continue
-                # if j == len(original_masked_ids[i]) - 1 and original_masked_ids[i][j] != tokenizer.mask_token_id::
-                #     del tmp_intervals[-1]
-                j+=1
-            del tmp_intervals[-1]
+                        while j < len(original_masked_ids[i]): 
+                            if not mask_signal:
+                                if original_masked_ids[i][j] != tokenizer.mask_token_id:
+                                    tmp_intervals[-1] += 1
+                                else:
+                                    mask_signal = True
+                                    # tmp_intervals.append(0)
+                                    # logger.info('zzzz{}'.format(j))
+                            else:
+                                if original_masked_ids[i][j] != tokenizer.mask_token_id:
+                                    mask_signal = False
+                                    tmp_intervals.append(1)
+                                # else:
+                                #     continue
+                            # if j == len(original_masked_ids[i]) - 1 and original_masked_ids[i][j] != tokenizer.mask_token_id::
+                            #     del tmp_intervals[-1]
+                            j+=1
+                        del tmp_intervals[-1]
 
-            for __ in consecutive_entity_positions[i]:
-                tmp_intervals.insert(__, 0)
+                        for __ in consecutive_entity_positions[i]:
+                            tmp_intervals.insert(__, 0)
 
-            assert len(entity_ids[i]) == len(tmp_intervals)
+                        assert len(entity_ids[i]) == len(tmp_intervals)
 
-            # try:
-            #     assert len(entity_ids[i]) == len(tmp_intervals)
-            # except AssertionError:
-            #     logger.info(len(entity_ids[i]))
-            #     logger.info(len(tmp_intervals))
-            #     logger.info(_)
-            #     logger.info(original_masked_ids[i])
-            #     logger.info(entity_ids[i])
-            #     logger.info(tmp_intervals)
-            #     logger.info(csv_data[i]['entity'])
-            #     logger.info(gold_lines[i])
-            #     logger.info(lines[i])
-            #     raise KeyboardInterrupt
-            j = sep_position + 1
-            for tmp_count in range(len(entity_ids[i])):
-                j = j + tmp_intervals[tmp_count]
-                for k in range(len(entity_ids[i][tmp_count])): 
-                    _[j+k] = self.tokenizer.mask_token_id
-                    # try: 
-                    #     _[j+k] = self.tokenizer.mask_token_id
-                    # except IndexError:
-                    #     logger.info(k)
-                    #     logger.info(j+k)
-                    #     logger.info(entity_ids[i][tmp_count])
-                    #     logger.info(_)
-                    #     logger.info(entity_ids[i])
-                    #     logger.info(csv_data[i]['entity'])
-                    #     logger.info(gold_lines[i])
-                    #     raise KeyboardInterrupt
-                    self.labels[i][j+k] = entity_ids[i][tmp_count][k]
-                j = j + len(entity_ids[i][tmp_count])
-                # tmp_count += 1
-            assert len(self.examples[i]) == len(self.labels[i])
-        
-        logger.info('#'*100)
-        logger.info(tokenizer.convert_ids_to_tokens(self.examples[10]))
-        logger.info('#'*40)
-        logger.info(tokenizer.convert_ids_to_tokens(self.labels[10]))
+                        j = sep_position + 1
+                        curr_position = j
+                        entity_positions.append([])
+                        for k in range(len(tmp_intervals)):
+                            # tmp_entity_position: [start_index, end_index]
+                            tmp_entity_position = [curr_position +tmp_intervals[k], curr_position +tmp_intervals[k] + len(entity_ids[i][k])]
+                            entity_positions[-1].append(tmp_entity_position)
+                            curr_position = tmp_entity_position[-1]
+                            
 
-        # self.examples
-        # self.labels
+                        # try:
+                        #     assert len(entity_ids[i]) == len(tmp_intervals)
+                        # except AssertionError:
+                        #     logger.info(len(entity_ids[i]))
+                        #     logger.info(len(tmp_intervals))
+                        #     logger.info(_)
+                        #     logger.info(original_masked_ids[i])
+                        #     logger.info(entity_ids[i])
+                        #     logger.info(tmp_intervals)
+                        #     logger.info(csv_data[i]['entity'])
+                        #     logger.info(gold_lines[i])
+                        #     logger.info(lines[i])
+                        #     raise KeyboardInterrupt
+                        j = sep_position + 1
+                        for tmp_count in range(len(entity_ids[i])):
+                            j = j + tmp_intervals[tmp_count]
+                            for k in range(len(entity_ids[i][tmp_count])): 
+                                _[j+k] = self.tokenizer.mask_token_id
+                                # try: 
+                                #     _[j+k] = self.tokenizer.mask_token_id
+                                # except IndexError:
+                                #     logger.info(k)
+                                #     logger.info(j+k)
+                                #     logger.info(entity_ids[i][tmp_count])
+                                #     logger.info(_)
+                                #     logger.info(entity_ids[i])
+                                #     logger.info(csv_data[i]['entity'])
+                                #     logger.info(gold_lines[i])
+                                #     raise KeyboardInterrupt
+                                self.labels[i][j+k] = entity_ids[i][tmp_count][k]
+                            j = j + len(entity_ids[i][tmp_count])
+                            # tmp_count += 1
+                        assert len(self.examples[i]) == len(self.labels[i])
+                    
+                    logger.info('#'*100)
+                    logger.info(tokenizer.convert_ids_to_tokens(self.examples[10]))
+                    logger.info('#'*40)
+                    logger.info(tokenizer.convert_ids_to_tokens(self.labels[10]))
+
+                    self.entity_positions = entity_positions
+
+                    # input_data include: self.examples, self.labels
+                    start = time.time()
+                    with open(cached_features_file, "wb") as handle:
+                        pickle.dump((self.examples, self.labels, self.gold_ids, self.entity_positions), handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    logger.info(
+                        f"Saving features into cached file %s [took %.3f s]", cached_features_file, time.time() - start
+                    )
+            
+            # for pseudo_data file
+            if os.path.exists(cached_features_file) and not overwrite_cache:
+                start = time.time()
+                with open(cached_features_file, "rb") as handle:
+                    self.classify_data, self.insertion_data = pickle.load(handle)
+                logger.info(
+                    f"Loading features from cached file {cached_features_file} [took %.3f s]", time.time() - start
+                )
+            
+            else:
+                logger.info("Creating features from dataset file at %s", file_path)
+                csv_data = self.read_csv(file_path)
+                # header: text, gold_entity, statistic
+                logger.info('Finishing reading csv file.')
+
+                '''
+                preprocessing for sequence labeling (to label tokens with factual errors)
+                '''
+                logger.info('Start to process sequence labeling data. ')
+                self.classify_data = {
+                    'input_ids': [],
+                    'label_ids': []
+                }
+                classify_tokens = []
+                for i, _ in enumerate(csv_data): 
+                    temp_words, temp_word_label_ids = [], []
+                    temp_words.append('[CLS]')
+                    temp_word_label_ids.append(0)
+                    for j, __ in enumerate(_['text']):
+                        if j == 0:
+                            temp_words += __
+                            temp_words.append('[SEP]')
+                            temp_word_label_ids += [0 for k in range(len(__))]
+                            temp_word_label_ids.append(0)
+                        else:
+                            for word in __: 
+                                if type(word) == str:
+                                    temp_words.append(word)
+                                    temp_word_label_ids.append(0)
+                                elif type(word) == list:
+                                    for k, sub_word in enumerate(word):
+                                        temp_words.append(sub_word)
+                                        if k == 0:
+                                            # append label "B"
+                                            temp_word_label_ids.append(1)
+                                        else:
+                                            # append label "I"
+                                            temp_word_label_ids.append(2)
+                                else:
+                                    raise TypeError("The word {} of type {} is neither str nor list. ".format(word, type(word)))
+                    temp_words.append('[SEP]')
+                    temp_word_label_ids.append(0)
+                    assert len(temp_words) == len(temp_word_label_ids)
+
+                    # bpe tokenize & processing labels
+                    temp_tokens, temp_token_label_ids = [], []
+                    for word, label in zip(temp_words, temp_word_label_ids):
+                        word_tokens = self.tokenizer.tokenize(word)
+                        if len(word_tokens) > 0:
+                            temp_tokens.extend(word_tokens)
+                            # Use the real label id for the first token of the word, and padding ids for the remaining tokens
+                            temp_token_label_ids.extend([label] + [pad_token_label_id] * (len(word_tokens) - 1))
+                    assert len(temp_tokens) == len(temp_token_label_ids)
+
+                    # convert tokens to vocab-ids
+                    # self.classify_data['input_ids'].append(
+                    #     self.tokenizer.convert_tokens_to_ids(temp_tokens)
+                    # )
+                    classify_tokens.append(temp_tokens)
+                    self.classify_data['label_ids'].append(temp_token_label_ids)
+                self.classify_data['input_ids'] = self.tokenizer.batch_encode_plus(
+                    classify_tokens,
+                    add_special_tokens=False,
+                    max_length=block_size,
+                    is_pretokenized=True,
+                )['input_ids']
+                logger.info('Finished processing sequence labeling data. ')
+
+                '''
+                preprocessing for seq2seq insertion deocding
+                '''
+                logger.info('Start to process seq2seq insertion data. ')
+                self.insertion_data = {
+                    'input_ids': [],
+                    'tgt_ids': [],
+                    'tgt_label_ids': [],
+                    'entity_positions': []
+                }
+                '''
+                    'input_ids': one entity is replaced by exactly one '[soe]' token.
+                    'tgt_ids': gold target sequence, with '[soe]' token inserted to the start position of each entity
+                    'tgt_mask': seq2seq decoder mask for insertion transformer
+
+                    examples:
+                        tokens of input_ids: 
+                            ['[CLS]', '-LRB-', 'CNN', '-RRB-', 'Former', 'Vice', 'President', 'Walter', 'Mondale', 'was', 'released', 
+                            'from', 'the', 'Mayo', 'Clinic', 'on', 'Saturday', 'after', 'being', 'admitted', 'with', 'influenza', ',', 
+                            'hospital', 'spokeswoman', 'Kelley', 'Luckstein', 'said', '.', '[SEP]', '[soe]', 'was', 
+                            'released', 'from', '[soe]', 'on', 'Saturday', ',', 'hospital', 'spokeswoman', 'said', '.', '[SEP]']
+                        tokens of tgt_ids: 
+                            ['[CLS]', '-LRB-', 'CNN', '-RRB-', 'Former', 'Vice', 'President', 'Walter', 'Mondale', 'was', 'released', 
+                            'from', 'the', 'Mayo', 'Clinic', 'on', 'Saturday', 'after', 'being', 'admitted', 'with', 'influenza', ',', 
+                            'hospital', 'spokeswoman', 'Kelley', 'Luckstein', 'said', '.', '[SEP]', 'Walter', 'Mondale',, '[eoe]' 'was', 
+                            'released', 'from', 'the', 'Mayo', 'Clinic', '[eoe]', 'on', 'Saturday', ',', 'hospital', 'spokeswoman', 'said', '.', '[SEP]']
+                '''
+                insertion_tokens, tgt_tokens, tgt_label_tokens = [], [], []
+                for i, _ in enumerate(csv_data): 
+                    temp_token_input, temp_token_tgt, temp_token_tgt_label, temp_entity_position = [], [], [], []
+                    temp_token_input.append('[CLS]')
+                    temp_token_tgt.append('[CLS]')
+                    count_entity = 0
+                    for j, __ in enumerate(_['text']):
+                        if j == 0:
+                            for word in __:
+                                temp_tokens = self.tokenizer.tokenize(word)
+                                temp_token_input += temp_tokens
+                                temp_token_tgt += temp_tokens
+                            temp_token_input.append('[SEP]')
+                            temp_token_tgt.append('[SEP]')
+                            temp_token_tgt_label += ['[UNK]' for kk in range(len(temp_token_tgt))]
+                        else:
+                            for word in __: 
+                                if type(word) == str:
+                                    temp_tokens = self.tokenizer.tokenize(word)
+                                    temp_token_input += temp_tokens
+                                    temp_token_tgt += temp_tokens
+                                    temp_token_tgt_label += ['[UNK]' for kk in range(len(temp_tokens))]
+                                elif type(word) == list:
+                                    temp_token_input.append('[soe]')
+                                    temp_entity_position.append([len(temp_token_tgt)])
+                                    temp_token_tgt.append('[soe]')
+                                    for entity_word in _['gold_entity'][count_entity]:
+                                        temp_tokens = self.tokenizer.tokenize(entity_word)
+                                        temp_token_tgt += temp_tokens
+                                        temp_token_tgt_label += temp_tokens
+                                    temp_token_tgt_label.append('[eoe]')
+                                    count_entity += 1
+                                    temp_entity_position[-1].append(len(temp_token_tgt))
+                                else:
+                                    raise TypeError("The word {} of type {} is neither str nor list. ".format(word, type(word)))
+                    temp_token_input.append('[SEP]')
+                    temp_token_tgt.append('[SEP]')
+                    temp_token_tgt_label.append('[UNK]')
+
+                    # convert tokens to ids
+                    # self.insertion_data['input_ids'].append(self.tokenizer.convert_tokens_to_ids(temp_token_input))
+                    # self.insertion_data['tgt_ids'].append(self.tokenizer.convert_tokens_to_ids(temp_token_tgt))
+                    # self.insertion_data['tgt_label_ids'].append(self.tokenizer.convert_tokens_to_ids(temp_token_tgt_label))
+                    insertion_tokens.append(temp_token_input)
+                    tgt_tokens.append(temp_token_tgt)
+                    tgt_label_tokens.append(temp_token_tgt_label)
+                    self.insertion_data['entity_positions'].append(temp_entity_position)
+                self.insertion_data['input_ids'] = self.tokenizer.batch_encode_plus(
+                    insertion_tokens,
+                    add_special_tokens=False,
+                    max_length=block_size,
+                    is_pretokenized=True,
+                )['input_ids']
+                self.insertion_data['tgt_ids'] = self.tokenizer.batch_encode_plus(
+                    tgt_tokens,
+                    add_special_tokens=False,
+                    max_length=block_size,
+                    is_pretokenized=True,
+                )['input_ids']
+                self.insertion_data['tgt_label_ids'] = self.tokenizer.batch_encode_plus(
+                    tgt_label_tokens,
+                    add_special_tokens=False,
+                    max_length=block_size,
+                    is_pretokenized=True,
+                )['input_ids']
+                logger.info('Finished processing seq2seq insertion data. ')
+
+                # input_data include: self.classify_data, self.insertion_data
+                start = time.time()
+                with open(cached_features_file, "wb") as handle:
+                    pickle.dump([self.classify_data, self.insertion_data], handle, protocol=pickle.HIGHEST_PROTOCOL)
+                logger.info(
+                    f"Saving features into cached file %s [took %.3f s]", cached_features_file, time.time() - start
+                )
 
     def __len__(self):
-        return len(self.examples)
+        # return len(self.examples)
+        return len(self.classify_data['input_ids'])
 
     def __getitem__(self, i) -> torch.Tensor:
+        # return {
+        #         'input_ids': torch.tensor(self.examples[i], dtype=torch.long), 
+        #         'mlm_label_ids': torch.tensor(self.labels[i], dtype=torch.long),
+        #         'tgt_ids': torch.tensor(self.gold_ids[i], dtype=torch.long),
+        #         'entity_positions': self.gold_ids[i],
+        #         }
         return {
-                'input_ids': torch.tensor(self.examples[i], dtype=torch.long), 
-                'mlm_label_ids': torch.tensor(self.labels[i], dtype=torch.long)
+                'input_ids_classify': torch.tensor(self.classify_data['input_ids'][i], dtype=torch.long), 
+                'input_ids_insertion': torch.tensor(self.insertion_data['input_ids'][i], dtype=torch.long),
+                'label_ids_classify': torch.tensor(self.classify_data['label_ids'][i], dtype=torch.long),
+                'tgt_ids': torch.tensor(self.insertion_data['tgt_ids'][i], dtype=torch.long),
+                'tgt_label_ids': torch.tensor(self.insertion_data['tgt_label_ids'][i], dtype=torch.long),
+                'entity_positions': self.insertion_data['entity_positions'][i]
                 }
     
     def read_csv(self, file_path): 
@@ -325,31 +548,33 @@ class CsvDataset(Dataset):
                 tmp_dict = dict()
                 for j, __ in enumerate(header):
                     tmp_dict[__] = eval(_[j])
-                    # classifying samples that have multi-hop entities
-                    if __ == 'entity':
-                        intervals = []
-                        for entity in tmp_dict[__]: 
-                            entity['text'] = ' '.join(entity['text']).replace('\xa0', '[UNK]').split()
-                            for interval in intervals:
-                                if (entity['position'][0] >= interval[0] and entity['position'][0] <= interval[1]) \
-                                    or (entity['position'][1] >= interval[0] and entity['position'][1] <= interval[1]):
-                                    continue_signal = True
+                    # ['entity' in header] means only_mask.csv
+                    if 'entity' in header:
+                        # classifying samples that have multi-hop entities
+                        if __ == 'entity':
+                            intervals = []
+                            for entity in tmp_dict[__]: 
+                                entity['text'] = ' '.join(entity['text']).replace('\xa0', '[UNK]').split()
+                                for interval in intervals:
+                                    if (entity['position'][0] >= interval[0] and entity['position'][0] <= interval[1]) \
+                                        or (entity['position'][1] >= interval[0] and entity['position'][1] <= interval[1]):
+                                        continue_signal = True
+                                        break
+                                if continue_signal:
                                     break
-                            if continue_signal:
-                                break
-                            intervals.append([entity['position'][0], entity['position'][1]])
-                    if continue_signal:
-                        break
-                    if __ == 'text': 
-                        # tmp_dict[__].append('[SEP]')
-                        tmp_dict[__] = ' '.join(tmp_dict[__]).replace('\xa0', '[UNK]').split()
-                        sep_position = tmp_dict[__].index('[SEP]')
-                        tmp_dict['text1'] = tmp_dict[__][:sep_position]
-                        tmp_dict['text1'].remove('[CLS]')
-                        tmp_dict['text2'] = tmp_dict[__][sep_position:]
-                        tmp_dict['text2'].remove('[SEP]')
-                if continue_signal:
-                    continue
+                                intervals.append([entity['position'][0], entity['position'][1]])
+                        if continue_signal:
+                            break
+                        if __ == 'text': 
+                            # tmp_dict[__].append('[SEP]')
+                            tmp_dict[__] = ' '.join(tmp_dict[__]).replace('\xa0', '[UNK]').split()
+                            sep_position = tmp_dict[__].index('[SEP]')
+                            tmp_dict['text1'] = tmp_dict[__][:sep_position]
+                            tmp_dict['text1'].remove('[CLS]')
+                            tmp_dict['text2'] = tmp_dict[__][sep_position:]
+                            tmp_dict['text2'].remove('[SEP]')
+                        if continue_signal:
+                            continue
                 rst.append(tmp_dict)
         return rst
 
@@ -364,24 +589,114 @@ class DataCollatorForFactualEditing(DataCollator):
     tokenizer: PreTrainedTokenizer
     mlm: bool = True
     mlm_probability: float = 0.15
+    description: str = 'classify'  # 'classify' or 'insertion'
 
     def collate_batch(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids = [_['input_ids'] for _ in examples]
-        mlm_label_ids = [_['mlm_label_ids'] for _ in examples]
-        inputs, labels = self._tensorize_batch(input_ids, mlm_label_ids)
+        # input_ids = [_['input_ids'] for _ in examples]
+        # mlm_label_ids = [_['mlm_label_ids'] for _ in examples]
+        # tgt_ids = [_['tgt_ids'] for _ in examples]
+        # entity_positions = [_['entity_positions'] for _ in examples]
+        input_ids_classify = [_['input_ids_classify'] for _ in examples]
+        input_ids_insertion = [_['input_ids_insertion'] for _ in examples]
+        label_ids_classify = [_['label_ids_classify'] for _ in examples]
+        tgt_ids = [_['tgt_ids'] for _ in examples]
+        tgt_label_ids = [_['tgt_label_ids'] for _ in examples]
+        entity_positions = [_['entity_positions'] for _ in examples]
+        
+        # inputs, labels, tgt = self._tensorize_batch(input_ids, mlm_label_ids, tgt_ids)
+        inputs_classify, inputs_insertion, labels_classify, tgt, tgt_labels = \
+            self._tensorize_batch(input_ids_classify, input_ids_insertion, label_ids_classify, tgt_ids, tgt_label_ids)
+        tgt_mask = self.make_decoder_attention_mask(tgt, entity_positions)
         # batch = self._tensorize_batch(examples)
         # if self.mlm:
         #     inputs, labels = self.mask_tokens(batch)
         #     return {"input_ids": inputs, "masked_lm_labels": labels}
         # else:
         #     return {"input_ids": batch, "labels": batch}
-        return {"input_ids": inputs, "masked_lm_labels": labels}
 
-    def _tensorize_batch(self, input_ids: List[torch.Tensor], mlm_label_ids: List[torch.Tensor]) -> torch.Tensor:
+        # print('#'*60)
+        # print('input_ids:\n', inputs_insertion[3])
+        # print('#'*60)
+        # print('tgt_ids:\n', tgt[3])
+        # print('#'*60)
+        # print('tgt_label_ids:\n', tgt_labels[3])
+        # print('#'*60)
+        # print('tgt_mask:\n', tgt_mask[3])
+        # print(self.tokenizer.batch_encode_plus([['a', '[soe]']]))
+        # print(self.tokenizer.decode([101, 1037, 102, 30522, 102]))
+        # raise KeyboardInterrupt
+
+        # # for masked-lm
+        # return {"input_ids": inputs, "masked_lm_labels": labels}
+        
+        # for classify
+        if self.description == 'classify':
+            return {
+                    'input_ids': inputs_classify, 
+                    'label_ids': labels_classify,
+                    }
+        # for seq2seq insertion
+        elif self.description == 'insertion':
+            return {
+                    'input_ids': inputs_insertion, 
+                    'decoder_input_ids': tgt,
+                    'masked_lm_labels': tgt_labels, 
+                    'decoder_attention_mask': tgt_mask
+                    }
+        else:
+            raise ValueError('The description for DataCollator, {}, is neither \'classify\' nor \'insertion\''.format(self.description))
+
+    def TakeSpanLength(self, x):
+        return x[1]-x[0]
+    def make_decoder_attention_mask(self, tgt, entity_positions):
+        '''
+        to make tgt masks for seq2seq-based insertion decoding
+        '''
+        # tgt = [batch_size, tgt_len]
+        # print('#'*80, type(tgt), '\n', type(tgt[0]), '#'*80)
+        tgt_pad_mask = (tgt != self.tokenizer.pad_token_id).type_as(torch.LongTensor()).unsqueeze(1)
+        # tgt_pad_mask = [batch size, 1, tgt_len]
+        batch_size = tgt.shape[0]
+        tgt_len = tgt.shape[1]
+        tgt_sub_mask = torch.ones((batch_size, tgt_len, tgt_len))
+        for i in range(batch_size):
+            entity_positions[i].sort(key=self.TakeSpanLength)
+        for i in range(batch_size):
+            for _ in entity_positions[i]:
+                tgt_sub_mask[i, :, _[0]:_[1]] = 0
+            for j, _ in enumerate(entity_positions[i]):
+                tmp_entity_len = _[1] - _[0]
+                tgt_sub_mask[i, _[0]:_[1], _[0]:_[1]] = torch.tril(torch.ones((tmp_entity_len, tmp_entity_len)))
+                k = j + 1
+                while k < len(entity_positions[i]):
+                    tgt_sub_mask[i, _[0]:_[1], entity_positions[i][k][0]:entity_positions[i][k][0]+tmp_entity_len] \
+                        = torch.tril(torch.ones((tmp_entity_len, tmp_entity_len)))
+                    tgt_sub_mask[i, entity_positions[i][k][0]:entity_positions[i][k][0]+tmp_entity_len, _[0]:_[1]] \
+                        = torch.tril(torch.ones((tmp_entity_len, tmp_entity_len)))
+                    tgt_sub_mask[i, entity_positions[i][k][0]+tmp_entity_len: entity_positions[i][k][1], _[0]:_[1]] = 1
+                    k += 1
+        # tgt_sub_mask: [batch_size, tgt_len, tgt_len]
+        tgt_sub_mask = tgt_sub_mask.type_as(torch.LongTensor())
+        tgt_mask = tgt_pad_mask & tgt_sub_mask
+        return tgt_mask
+
+    # input_ids_classify, input_ids_insertion, label_ids_classify, tgt_ids, tgt_label_ids
+    def _tensorize_batch(
+                    self, 
+                    input_ids: List[torch.Tensor], 
+                    input_ids_insertion: List[torch.Tensor], 
+                    label_ids_classify: List[torch.Tensor], 
+                    tgt_ids,
+                    tgt_label_ids,
+                    ) -> torch.Tensor:
         length_of_first = input_ids[0].size(0)
         are_tensors_same_length = all(x.size(0) == length_of_first for x in input_ids)
         if are_tensors_same_length:
-            return torch.stack(input_ids, dim=0), torch.stack(mlm_label_ids, dim=0)
+            return torch.stack(input_ids, dim=0),\
+                    torch.stack(input_ids_insertion, dim=0), \
+                    torch.stack(label_ids_classify, dim=0), \
+                    torch.stack(tgt_ids, dim=0), \
+                    torch.stack(tgt_label_ids, dim=0)
         else:
             if self.tokenizer._pad_token is None:
                 raise ValueError(
@@ -389,42 +704,10 @@ class DataCollatorForFactualEditing(DataCollator):
                     f" ({self.tokenizer.__class__.__name__}) does not have one."
                 )
             return pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id), \
-                    pad_sequence(mlm_label_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
-
-    def mask_tokens(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original.
-        """
-
-        if self.tokenizer.mask_token is None:
-            raise ValueError(
-                "This tokenizer does not have a mask token which is necessary for masked language modeling. Remove the --mlm flag if you want to use this tokenizer."
-            )
-
-        labels = inputs.clone()
-        # We sample a few tokens in each sequence for masked-LM training (with probability args.mlm_probability defaults to 0.15 in Bert/RoBERTa)
-        probability_matrix = torch.full(labels.shape, self.mlm_probability)
-        special_tokens_mask = [
-            self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
-        ]
-        probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
-        if self.tokenizer._pad_token is not None:
-            padding_mask = labels.eq(self.tokenizer.pad_token_id)
-            probability_matrix.masked_fill_(padding_mask, value=0.0)
-        masked_indices = torch.bernoulli(probability_matrix).bool()
-        labels[~masked_indices] = -100  # We only compute loss on masked tokens
-
-        # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
-        indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
-        inputs[indices_replaced] = self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
-
-        # 10% of the time, we replace masked input tokens with random word
-        indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-        random_words = torch.randint(len(self.tokenizer), labels.shape, dtype=torch.long)
-        inputs[indices_random] = random_words[indices_random]
-
-        # The rest of the time (10% of the time) we keep the masked input tokens unchanged
-        return inputs, labels
+                    pad_sequence(input_ids_insertion, batch_first=True, padding_value=self.tokenizer.pad_token_id), \
+                    pad_sequence(label_ids_classify, batch_first=True, padding_value=self.tokenizer.pad_token_id), \
+                    pad_sequence(tgt_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id), \
+                    pad_sequence(tgt_label_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -483,6 +766,9 @@ def main():
         config = CONFIG_MAPPING[model_args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
+    config.share_bert_param = model_args.share_bert_param
+    config.classify_or_insertion = model_args.classify_or_insertion
+
     if model_args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, cache_dir=model_args.cache_dir)
     elif model_args.model_name_or_path:
@@ -493,18 +779,39 @@ def main():
             "and load it from here, using --tokenizer_name"
         )
 
+    # if model_args.model_name_or_path:
+    #     model = BertForTextEditing.from_pretrained(
+    #         model_args.model_name_or_path,
+    #         from_tf=bool(".ckpt" in model_args.model_name_or_path),
+    #         config=config,
+    #         cache_dir=model_args.cache_dir,
+    #     )
+    # else:
+    #     logger.info("Training new model from scratch")
+    #     model = BertForTextEditing.from_config(config)
+
     if model_args.model_name_or_path:
-        model = AutoModelWithLMHead.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
+        model = EncoderDecoderInsertionModel.from_encoder_decoder_pretrained(
+            model_args.model_name_or_path, 
+            model_args.model_name_or_path, 
+            encoder_from_tf=bool(".ckpt" in model_args.model_name_or_path), 
+            decoder_from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            encoder_config=config,
+            decoder_config=config, 
+            encoder_cache_dir=model_args.cache_dir,
+            decoder_cache_dir=model_args.cache_dir,
         )
     else:
         logger.info("Training new model from scratch")
-        model = AutoModelWithLMHead.from_config(config)
+        model = EncoderDecoderInsertionModel.from_config(config)
 
-    model.resize_token_embeddings(len(tokenizer))
+    # add new tokens for seq2seq insertion decoding (similar to <s> and <\s> in common left-to-right seq2seq decoding)
+    new_tokens = ['[soe]', '[eoe]']  # StartOfEntity, EndOfEntity
+    num_added_toks = tokenizer.add_tokens(new_tokens)
+    logger.info('We have added {} tokens'.format(num_added_toks))
+    model.encoder.resize_token_embeddings(len(tokenizer))
+    model.decoder.resize_token_embeddings(len(tokenizer))
+
 
     if config.model_type in ["bert", "roberta", "distilbert", "camembert"] and not data_args.mlm:
         raise ValueError(
@@ -530,11 +837,11 @@ def main():
         else None
     )
     data_collator = DataCollatorForFactualEditing(
-        tokenizer=tokenizer, mlm=data_args.mlm, mlm_probability=data_args.mlm_probability
+        tokenizer=tokenizer, mlm=data_args.mlm, mlm_probability=data_args.mlm_probability, description=model_args.classify_or_insertion
     )
 
     # Initialize our Trainer
-    trainer = Trainer(
+    trainer = TrainerForFactualEditing(
         model=model,
         args=training_args,
         data_collator=data_collator,
@@ -581,134 +888,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-'''
-    python run_language_modeling.py --help
-    I0504 16:16:48.721203 139835076368128 file_utils.py:38] PyTorch version 1.4.0 available.
-    usage: run_language_modeling.py [-h] [--model_name_or_path MODEL_NAME_OR_PATH]
-                                    [--model_type MODEL_TYPE]
-                                    [--config_name CONFIG_NAME]
-                                    [--tokenizer_name TOKENIZER_NAME]
-                                    [--cache_dir CACHE_DIR]
-                                    [--train_data_file TRAIN_DATA_FILE]
-                                    [--eval_data_file EVAL_DATA_FILE]
-                                    [--line_by_line] [--mlm]
-                                    [--mlm_probability MLM_PROBABILITY]
-                                    [--block_size BLOCK_SIZE] [--overwrite_cache]
-                                    --output_dir OUTPUT_DIR
-                                    [--overwrite_output_dir] [--do_train]
-                                    [--do_eval] [--do_predict]
-                                    [--evaluate_during_training]
-                                    [--per_gpu_train_batch_size PER_GPU_TRAIN_BATCH_SIZE]
-                                    [--per_gpu_eval_batch_size PER_GPU_EVAL_BATCH_SIZE]
-                                    [--gradient_accumulation_steps GRADIENT_ACCUMULATION_STEPS]
-                                    [--learning_rate LEARNING_RATE]
-                                    [--weight_decay WEIGHT_DECAY]
-                                    [--adam_epsilon ADAM_EPSILON]
-                                    [--max_grad_norm MAX_GRAD_NORM]
-                                    [--num_train_epochs NUM_TRAIN_EPOCHS]
-                                    [--max_steps MAX_STEPS]
-                                    [--warmup_steps WARMUP_STEPS]
-                                    [--logging_dir LOGGING_DIR]
-                                    [--logging_first_step]
-                                    [--logging_steps LOGGING_STEPS]
-                                    [--save_steps SAVE_STEPS]
-                                    [--save_total_limit SAVE_TOTAL_LIMIT]
-                                    [--no_cuda] [--seed SEED] [--fp16]
-                                    [--fp16_opt_level FP16_OPT_LEVEL]
-                                    [--local_rank LOCAL_RANK]
-
-    optional arguments:
-    -h, --help            show this help message and exit
-    --model_name_or_path MODEL_NAME_OR_PATH
-                            The model checkpoint for weights initialization. Leave
-                            None if you want to train a model from scratch.
-    --model_type MODEL_TYPE
-                            If training from scratch, pass a model type from the
-                            list: t5, distilbert, albert, camembert, xlm-roberta,
-                            bart, roberta, bert, openai-gpt, gpt2, transfo-xl,
-                            xlnet, flaubert, xlm, ctrl, electra, encoder_decoder
-    --config_name CONFIG_NAME
-                            Pretrained config name or path if not the same as
-                            model_name
-    --tokenizer_name TOKENIZER_NAME
-                            Pretrained tokenizer name or path if not the same as
-                            model_name
-    --cache_dir CACHE_DIR
-                            Where do you want to store the pretrained models
-                            downloaded from s3
-    --train_data_file TRAIN_DATA_FILE
-                            The input training data file (a text file).
-    --eval_data_file EVAL_DATA_FILE
-                            An optional input evaluation data file to evaluate the
-                            perplexity on (a text file).
-    --line_by_line        Whether distinct lines of text in the dataset are to
-                            be handled as distinct sequences.
-    --mlm                 Train with masked-language modeling loss instead of
-                            language modeling.
-    --mlm_probability MLM_PROBABILITY
-                            Ratio of tokens to mask for masked language modeling
-                            loss
-    --block_size BLOCK_SIZE
-                            Optional input sequence length after tokenization.The
-                            training dataset will be truncated in block of this
-                            size for training.Default to the model max input
-                            length for single sentence inputs (take into account
-                            special tokens).
-    --overwrite_cache     Overwrite the cached training and evaluation sets
-    --output_dir OUTPUT_DIR
-                            The output directory where the model predictions and
-                            checkpoints will be written.
-    --overwrite_output_dir
-                            Overwrite the content of the output directory.Use this
-                            to continue training if output_dir points to a
-                            checkpoint directory.
-    --do_train            Whether to run training.
-    --do_eval             Whether to run eval on the dev set.
-    --do_predict          Whether to run predictions on the test set.
-    --evaluate_during_training
-                            Run evaluation during training at each logging step.
-    --per_gpu_train_batch_size PER_GPU_TRAIN_BATCH_SIZE
-                            Batch size per GPU/CPU for training.
-    --per_gpu_eval_batch_size PER_GPU_EVAL_BATCH_SIZE
-                            Batch size per GPU/CPU for evaluation.
-    --gradient_accumulation_steps GRADIENT_ACCUMULATION_STEPS
-                            Number of updates steps to accumulate before
-                            performing a backward/update pass.
-    --learning_rate LEARNING_RATE
-                            The initial learning rate for Adam.
-    --weight_decay WEIGHT_DECAY
-                            Weight decay if we apply some.
-    --adam_epsilon ADAM_EPSILON
-                            Epsilon for Adam optimizer.
-    --max_grad_norm MAX_GRAD_NORM
-                            Max gradient norm.
-    --num_train_epochs NUM_TRAIN_EPOCHS
-                            Total number of training epochs to perform.
-    --max_steps MAX_STEPS
-                            If > 0: set total number of training steps to perform.
-                            Override num_train_epochs.
-    --warmup_steps WARMUP_STEPS
-                            Linear warmup over warmup_steps.
-    --logging_dir LOGGING_DIR
-                            Tensorboard log dir.
-    --logging_first_step  Log and eval the first global_step
-    --logging_steps LOGGING_STEPS
-                            Log every X updates steps.
-    --save_steps SAVE_STEPS
-                            Save checkpoint every X updates steps.
-    --save_total_limit SAVE_TOTAL_LIMIT
-                            Limit the total amount of checkpoints.Deletes the
-                            older checkpoints in the output_dir. Default is
-                            unlimited checkpoints
-    --no_cuda             Avoid using CUDA even if it is available
-    --seed SEED           random seed for initialization
-    --fp16                Whether to use 16-bit (mixed) precision (through
-                            NVIDIA apex) instead of 32-bit
-    --fp16_opt_level FP16_OPT_LEVEL
-                            For fp16: Apex AMP optimization level selected in
-                            ['O0', 'O1', 'O2', and 'O3'].See details at
-                            https://nvidia.github.io/apex/amp.html
-    --local_rank LOCAL_RANK
-                            For distributed training: local_rank
-'''

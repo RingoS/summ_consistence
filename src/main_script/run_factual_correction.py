@@ -371,6 +371,17 @@ def train(args, train_dataset, model, tokenizer):
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
     )
+
+    # Check if saved optimizer or scheduler states exist
+    if (
+        args.model_name_or_path is not None
+        and os.path.isfile(os.path.join(args.model_name_or_path, "optimizer.pt"))
+        and os.path.isfile(os.path.join(args.model_name_or_path, "scheduler.pt"))
+    ):
+        # Load in optimizer and scheduler states
+        optimizer.load_state_dict(torch.load(os.path.join(args.model_name_or_path, "optimizer.pt")))
+        scheduler.load_state_dict(torch.load(os.path.join(args.model_name_or_path, "scheduler.pt")))
+
     if args.fp16:
         try:
             from apex import amp
@@ -387,6 +398,9 @@ def train(args, train_dataset, model, tokenizer):
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
         )
+
+    if tb_writer is not None:
+        tb_writer.add_text("args", args.to_json_string())
 
     # Train!
     logger.info("***** Running training *****")

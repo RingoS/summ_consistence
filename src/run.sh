@@ -1,4 +1,4 @@
-LOG_PATH=/data/senyang/summ_consistence/mlm/test_mlm
+LOG_PATH=/data/senyang/summ_consistence/log/seq2seq_insertion_1
 
 CUDA_VISIBLE_DEVICES=1 python main.py \
 --output_dir $LOG_PATH/ \
@@ -6,12 +6,15 @@ CUDA_VISIBLE_DEVICES=1 python main.py \
 --num_train_epochs 5 \
 --logging_dir $LOG_PATH/tensorboad_log/ \
 --logging_first_step True \
---save_steps 1000 \
+--logging_steps 2000 \
+--save_steps 4000 \
 --save_total_limit 30 \
---model_name_or_path bert-base-uncased \
---config_name bert-base-uncased \
+--model_name_or_path /data/senyang/data/bert_model/uncased_L-12_H-768_A-12/ \
 --tokenizer_name bert-base-uncased \
---train_data_file /data/senyang/summ_consistence/spacy_ner_data/train/only_mask.csv \
---eval_data_file /data/senyang/summ_consistence/spacy_ner_data/val/only_mask.csv \
+--train_data_file /data/senyang/summ_consistence/spacy_ner_data/train/pseudo_data.csv \
+--eval_data_file /data/senyang/summ_consistence/spacy_ner_data/val/pseudo_data.csv \
 --mlm True \
---fp16 True 
+--fp16 True \
+--share_bert_param True \
+--per_gpu_train_batch_size 4 \
+--per_gpu_eval_batch_size 4
