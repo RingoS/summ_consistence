@@ -35,6 +35,8 @@ This Trainer is modified based on 'transformers' package Trainer.
 logger = logging.getLogger(__name__)
 
 PREFIX_CHECKPOINT_DIR = "checkpoint"
+START_OF_ENTITY_index = 30522
+END_OF_ENTITY_index = 30523
 
 @contextmanager
 def torch_distributed_zero_first(local_rank: int):
@@ -265,16 +267,25 @@ class TrainerForFactualEditing(Trainer):
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
         return TrainOutput(global_step, tr_loss / global_step)
 
-    def _prediction_loop(
+    def predict(self, test_dataset=None, mode=None) -> PredictionOutput:
+        """
+        Run prediction and return predictions and potential metrics.
+
+        Depending on the dataset and your use case, your test dataset may contain labels.
+        In that case, this method will also return metrics, like in evaluate().
+        """
+        assert mode in ['classify', 'insertion']
+        test_dataloader = self.get_test_dataloader(test_dataset)
+        if mode=='classify':
+            return self._inference(test_dataloader, description="Detection")
+        elif mode =='insertion':
+            return self._inference(test_dataloader, description="Editing")
+
+    def _inference(
         self, dataloader: DataLoader, description: str, prediction_loss_only: Optional[bool] = None
     ) -> PredictionOutput:
-        """
-        Prediction/evaluation loop, shared by `evaluate()` and `predict()`.
 
-        Works both with or without labels.
-        """
-
-        prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else self.prediction_loss_only
+        assert description in ['Detection', 'Editing']
 
         # multi-gpu eval
         if self.args.n_gpu > 1 and not isinstance(self.model, torch.nn.DataParallel):
@@ -286,41 +297,73 @@ class TrainerForFactualEditing(Trainer):
         logger.info("***** Running %s *****", description)
         logger.info("  Num examples = %d", len(dataloader.dataset))
         logger.info("  Batch size = %d", dataloader.batch_size)
-        eval_losses: List[float] = []
-        preds: np.ndarray = None
-        label_ids: np.ndarray = None
-        model.eval()
 
-        for inputs in tqdm(dataloader, desc=description):
-            has_labels = any(inputs.get(k) is not None for k in ["labels", "masked_lm_labels"])
+        if description == 'Detection':
+            
+        elif description == 'Editing':
+            encoder_input_ids, decoder_output_ids = [], []
+            model.eval()
 
-            for k, v in inputs.items():
-                inputs[k] = v.to(self.args.device)
-
-            with torch.no_grad():
-                outputs = model(**inputs)
+            for inputs in tqdm(dataloader, desc=description):
+                has_labels = any(inputs.get(k) is not None for k in ["labels", "masked_lm_labels"])
                 if has_labels:
-                    step_eval_loss, logits = outputs[:2]
-                    eval_losses += [step_eval_loss.mean().item()]
-                else:
-                    logits = outputs[0]
+                    raise ValueError('Labels shouldn\'t be included in input for inference. ') 
 
-            if not prediction_loss_only:
-                if preds is None:
-                    preds = logits.detach().cpu().numpy()
-                else:
-                    preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
-                if inputs.get("labels") is not None:
-                    if label_ids is None:
-                        label_ids = inputs["labels"].detach().cpu().numpy()
-                    else:
-                        label_ids = np.append(label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
+                for k, v in inputs.items():
+                    inputs[k] = v.to(self.args.device)
 
-        if self.compute_metrics is not None and preds is not None and label_ids is not None:
-            metrics = self.compute_metrics(EvalPrediction(predictions=preds, label_ids=label_ids))
-        else:
-            metrics = {}
-        if len(eval_losses) > 0:
-            metrics["loss"] = np.mean(eval_losses)
+                for sample_count in range(inputs['input_ids'].shape[0]):
+                    temp_inputs = dict()
+                    for k, v in inputs.items():
+                        temp_inputs[k] = v[sample_count].unsqueeze(0)
+                    insertion_position = []
+                    for input_ids_position, _ in enumerate(temp_inputs['input_ids']):
+                        if _ == START_OF_ENTITY_index:
+                            insertion_position.append(input_ids_position)
+                    for inference_step in range(self.args.max_inference_len):
+                        with torch.no_grad():
+                            outputs = model(**temp_inputs)
+                            logits = outputs[0]
+                            temp_inputs['encoder_output'] = outputs[1:]
+                        preds = np.argmax(logits.detach().cpu().numpy(), axis=2)
+                        # preds = [1, seq_len]
+                        temp_decoder_input_ids = temp_inputs['decoder_input_ids']
+                        del_insertion_position = []
+                        for temp_position, _ in enumerate(insertion_position):
+                            if preds[0, _] == END_OF_ENTITY_index:
+                                del_insertion_position.append(temp_position)
+                                continue
+                            temp_decoder_input_ids = torch.cat(
+                                        [temp_decoder_input_ids[:, :_], torch.tensor(preds[0, _]).type_as(torch.LongTensor()).unsqueeze(0), temp_decoder_input_ids[:, _:]],
+                                        dim=1
+                                        )
+                        for _ in del_insertion_position:
+                            del insertion_position[_]
+                        temp_inputs['decoder_input_ids'] = temp_decoder_input_ids
+                        if len(insertion_position) == 0:
+                            break
+                        for _ in insertion_position:
+                            _ += 1
+                    decoder_output_ids.append(temp_inputs['decoder_input_ids'])
+                    encoder_input_ids.append(temp_inputs['input_ids'])
+            return decoder_output_ids, encoder_input_ids
+                        
+                
 
-        return PredictionOutput(predictions=preds, label_ids=label_ids, metrics=metrics)
+
+    def padding_ndarray(self, ndarray=None, padding_max_length=512, axis=1, padding_id=-100):
+        padding_array_shape = list(ndarray.shape)
+        for i, size in enumerate(padding_array_shape):
+            if i == axis:
+                padding_array_shape[i] = padding_max_length - size
+        padding_array = np.zeros(padding_array_shape)
+        padding_array.fill(padding_id)
+        # print(ndarray.shape, '\n', padding_array.shape)
+        result = np.concatenate((ndarray, padding_array), axis=axis)
+        return result
+
+    def convert_to_np_array(self, torch_tensor, description=None):
+        if description == 'classify':
+            return torch_tensor.detach().cpu().numpy()
+        elif description == 'insertion':
+            return np.argmax(torch_tensor.detach().cpu().numpy(), axis=2)
