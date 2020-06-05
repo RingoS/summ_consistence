@@ -106,6 +106,9 @@ def main(unused_argv):
 if __name__ == '__main__':
     # flags.DEFINE_string('dataset_name', 'cnn_dm', 'Which dataset to use. Can be {cnn_dm, xsum, duc_2004}')
     # flags.DEFINE_string('dataset_split', 'all', 'Which dataset split to use. Must be one of {train, val, test, all}')
+
+    # python matching_source/highlight_heuristic.py --data_path /data/senyang/summ_consistence/previous_work/ACL-19_Ranking/summary-correctness-v1.0/test_chen18_org/
+    
     flags.DEFINE_string('data_path', None, 'path of the folder which contains articles and summaries files')
     flags.DEFINE_integer('sentence_limit', 2, 'Max number of sentences to include for merging.')
     flags.DEFINE_integer('top_n_sents', -1, 'Number of sentences to take from the beginning of the article. Use -1 to run on entire article.')

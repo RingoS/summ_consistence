@@ -716,7 +716,8 @@ def pseudo_data_algorithm_only_mask(highlight_doc, summary_doc, prob=0.5):
     result['label'] = label
     return result
 
-def pseudo_data_algorithm_new(highlight_doc, summary_doc, number_vocab=None, prob={'name':0.5, 'number':0.5, 'pronoun':0.5}):
+def pseudo_data_algorithm_new(highlight_doc, summary_doc, name_vocab=None, number_vocab=None, prob={'name':0.5, 'number':0.5, 'pronoun':0.5}):
+    
     tmp_data_statistic = {
         'name': 0,
         'number': 0,
@@ -785,14 +786,26 @@ def pseudo_data_algorithm_new(highlight_doc, summary_doc, number_vocab=None, pro
                 output_overlapping=True
                 )
         if overlapping_signal and random.random() <= prob[_['group']]:
+            # name
             if _['group'] == 'name':
-                if len(non_overlapping_entity) == 0:
-                    continue
-                replace_entity = random.sample(non_overlapping_entity, 1)[0]
-                replace_entity = replace_entity.get('text').split()
+                # 50% chance to do swapping with entityies [inside] the sentence
+                if random.random() <= 0.5:
+                    if len(non_overlapping_entity) == 0:
+                        continue
+                    replace_entity = random.sample(non_overlapping_entity, 1)[0]
+                    replace_entity = replace_entity.get('text').split()
+                # 50% chance to do swapping with entityies [outside] the sentence
+                else:
+                    temp_type = 'PERSON' if _['type'] == 'PERSON' else 'OTHER'
+                    replace_entity = _
+                    while replace_entity['text'] == _['text']:
+                        replace_entity = random.sample(name_vocab[temp_type], 1)[0]
+                    replace_entity = replace_entity.get('text').split()
+            # number
             elif _['group'] == 'number':
                 replace_entity = random.sample(number_vocab[_['type']], 1)[0]
                 replace_entity = replace_entity.get('text').split()
+            # pronoun
             elif _['group'] == 'pronoun':
                 for __ in utils.pronoun_lists[_['type']]:
                     if __ != _['text']:
@@ -836,11 +849,30 @@ def main_func(tagged_data, use_single_summ_sentence = False, mode = 'classifier'
     }
     
 
-    number_vocab = dict()
+    name_vocab, number_vocab = dict(), dict()
     pseudo_highlights = []
     only_mask_data = []
 
     result_data, result_data_statistics = [], []
+
+    ## build name vocab
+    for _ in utils.name_type:
+        name_vocab[_] = []
+    for i, _ in enumerate(tagged_data):
+        tmp_highlight_ent = []
+        # tmp_summary_ent = [get_entity(zz) for zz in _['summary']]
+        for j, __ in enumerate(_['highlight']):
+            tmptmp_highlight_ent = []
+            for sent in __:
+                tmptmp_highlight_ent += get_entity(sent)['name']
+            tmp_highlight_ent.append(tmptmp_highlight_ent)
+        for j, __ in enumerate(tmp_highlight_ent):
+            for ___ in __: 
+                if ___['group'] == 'name':
+                    if ___['type'] == 'PERSON':
+                        name_vocab['PERSON'].append(___)
+                    else:
+                        name_vocab['OTHER'].append(___)
 
     ## build number vocab
     for _ in utils.number_type:
@@ -860,6 +892,9 @@ def main_func(tagged_data, use_single_summ_sentence = False, mode = 'classifier'
     # for _ in number_vocab.keys():
     #     number_vocab[_] = list(set(number_vocab[_]))
 
+    result_data_prototype, result_data_statistics_prototype = [], []
+    # whether a sample has been changed
+    swapping_signals = []
 
     for i, _ in enumerate(tagged_data): 
         for j, __ in enumerate(_['highlight']):
@@ -870,15 +905,34 @@ def main_func(tagged_data, use_single_summ_sentence = False, mode = 'classifier'
                     only_mask_data.append(temp_sample)
             
             else:
-                temp_sample, temp_data_statistic = pseudo_data_algorithm_new(__, _['summary'][j], number_vocab=number_vocab)
+                temp_sample, temp_data_statistic = pseudo_data_algorithm_new(__, _['summary'][j], name_vocab=name_vocab, number_vocab=number_vocab)
                 all_count = 0
                 for value in temp_data_statistic.values():
                     all_count += value
-                if all_count >= 2:
-                    for entity_type_key in temp_data_statistic.keys():
-                        data_statistics[entity_type_key][temp_data_statistic[entity_type_key]] += 1
-                    result_data.append(temp_sample)
-                    result_data_statistics.append(temp_data_statistic)
+                swapping_signals.append(
+                                        (1 if all_count != 0 else 0)
+                                    )
+                result_data_prototype.append(temp_sample)
+                result_data_statistics_prototype.append(temp_data_statistic)
+    
+    if not only_mask:
+        probab =  swapping_signals.count(0)/swapping_signals.count(1)
+
+        for i, _ in enumerate(result_data_prototype):
+            # ---
+            # # 50% is positive samples
+            # if (swapping_signals[i] == 0 and random.random() <= probab) or (swapping_signals[i] == 1):
+            # ---
+            # -----
+            # all negative samples
+            if swapping_signals[i] == 1:
+                result_data.append(result_data_prototype[i])
+                result_data_statistics.append(result_data_statistics_prototype[i])
+                for entity_type_key in result_data_statistics_prototype[i].keys():
+                    data_statistics[entity_type_key][result_data_statistics_prototype[i][entity_type_key]] += 1
+
+
+
             # else: 
             #     if use_single_summ_sentence:
             #         # 1.

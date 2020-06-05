@@ -23,6 +23,8 @@ male_pronoun = {'he', 'him', 'his', 'himself'}
 
 number_type = ['DATE', 'TIME', 'PERCENT', 'MONEY', 'QUANTITY', 'ORDINAL', 'CARDINAL']
 
+name_type = ['PERSON', 'OTHER']
+
 # Stop words
 STOP_WORDS = set(
     """

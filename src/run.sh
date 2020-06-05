@@ -1,3 +1,4 @@
+# run training
 LOG_PATH=/data/senyang/summ_consistence/log/classify_1
 LOG_PATH=/data/senyang/summ_consistence/log/seq2seq_insertion_1
 
@@ -20,3 +21,23 @@ CUDA_VISIBLE_DEVICES=1 python main.py \
 --per_gpu_train_batch_size 4 \
 --per_gpu_eval_batch_size 4 \
 --classify_or_insertion classify
+
+
+# run detection
+LOG_PATH=/data/senyang/summ_consistence/log/SOME_LOG_PATH
+
+CUDA_VISIBLE_DEVICES=1 python main.py \
+--output_dir $LOG_PATH/ \
+--do_inference True \
+--logging_dir $LOG_PATH/tensorboad_log/ \
+--model_name_or_path /data/senyang/summ_consistence/log/SOME_CHECKPOINT/ \
+--tokenizer_name bert-base-uncased \
+--train_data_file /data/senyang/summ_consistence/spacy_ner_data/train/pseudo_data.csv \
+--eval_data_file /data/senyang/summ_consistence/spacy_ner_data/val/pseudo_data.csv \
+--mlm True \
+--fp16 True \
+--share_bert_param True \
+--per_gpu_train_batch_size 8 \
+--per_gpu_eval_batch_size 8 \
+--classify_or_insertion classify \
+--test_data_file /data/senyang/summ_consistence/previous_work/ACL-19_Ranking/summary-correctness-v1.0/test_chen18_org/

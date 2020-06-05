@@ -25,7 +25,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     url_hex_list, summary_hex_list = [], []
-    articles = []
     article_source = []
 
     with open(args.url_path, 'r', encoding='utf-8') as f:
@@ -38,12 +37,14 @@ if __name__ == "__main__":
         lines = f.readlines()
         article_source = list(lines)
 
+    articles = []
 
     for i, file_name in enumerate(summary_files):
         dir_name = os.path.join(args.summary_path, file_name.split('.')[0])
         if not os.path.isdir(dir_name):
             os.makedirs(dir_name)
         summaries = []
+
         with open(os.path.join(args.summary_path, summary_files[i]), 'r', encoding='utf-8') as f:
             summary_content = json.load(f)
         for _ in summary_content.keys():
@@ -54,7 +55,7 @@ if __name__ == "__main__":
                 raise KeyboardInterrupt
 
             if len(articles) != len(summary_content):
-                articles.append(sent_tokenize(article_source[temp_index]))
+                articles.append([__.lower() for __ in sent_tokenize(article_source[temp_index])])
             summaries.append([])
             for j in range(10):
                 if summary_content[_]['sents'].get(str(j)) == None:

@@ -57,7 +57,7 @@ from transformers import (
     AutoModelForTokenClassification,
 )
 
-from transformers import DataCollator, PreTrainedModel, EvalPrediction, DefaultDataCollator
+from transformers import DataCollator, PreTrainedModel, EvalPrediction, DefaultDataCollator, EncoderDecoderConfig
 from tqdm.auto import tqdm, trange
 
 from models import BertForTextEditing, EncoderDecoderInsertionModel, BertForTokenClassification_modified
@@ -73,6 +73,9 @@ label_map = {0: 'O', 1: 'B', 2: 'I'}
 sequence_labeling_label_ids = [0, 1, 2]  # [O, B, I]
 pad_token_label_id = -100
 sequence_a_segment_id = 0
+START_OF_ENTITY_index = 30522
+END_OF_ENTITY_index = 30523
+
 
 
 @dataclass
@@ -137,6 +140,10 @@ class DataTrainingArguments:
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
     )
+    test_data_file: Optional[str] = field(
+        default=None,
+        metadata={"help": ""},
+    )
 
 @dataclass
 class AdditionalArguments:
@@ -166,7 +173,7 @@ def get_dataset(args: DataTrainingArguments, tokenizer: PreTrainedTokenizer, des
         file_path = args.test_data_file
     elif description is 'edit':
         # for seq2seq insertion decoding
-        file_path = args.inference_data_file
+        file_path = args.test_data_file
     return CsvDataset(
             tokenizer=tokenizer, file_path=file_path, block_size=args.block_size, local_rank=local_rank, description=description
         )
@@ -179,7 +186,7 @@ class CsvDataset(Dataset):
 
     def __init__(self, tokenizer: PreTrainedTokenizer, file_path: str, block_size: int, local_rank=-1, overwrite_cache=False, description=None):
         assert description in ['train', 'eval', 'detect', 'edit']
-        if description in ['train', 'eval']:
+        if description in ['train', 'eval', 'edit']:
             assert os.path.isfile(file_path)
         else:
             assert os.path.isdir(file_path)
@@ -373,6 +380,15 @@ class CsvDataset(Dataset):
                     logger.info(
                         f"Loading features from cached file {cached_features_file} [took %.3f s]", time.time() - start
                     )
+                    
+                    ###############   debug only   ############################
+                    if description == 'eval':
+                        threshold = 100
+                        for _ in self.classify_data.keys():
+                            self.classify_data[_] = self.classify_data[_][:threshold]
+                        for _ in self.insertion_data.keys():
+                            self.insertion_data[_] = self.insertion_data[_][:threshold]
+                    ############################################################
                 
                 else:
                     logger.info("Creating features from dataset file at %s", file_path)
@@ -485,6 +501,7 @@ class CsvDataset(Dataset):
                         temp_token_tgt.append(self.tokenizer.cls_token)
                         count_entity = 0
                         for j, __ in enumerate(_['text']):
+                            assert j in [0, 1]
                             if j == 0:
                                 for word in __:
                                     temp_tokens = self.tokenizer.tokenize(word)
@@ -571,9 +588,9 @@ class CsvDataset(Dataset):
             pad_to_max_length = False
             pad_to_max_length_file_prefix = ''
 
-            dir_name = file_path.split('/')[-1]
+            dir_name = file_path.split('/')[-1] if file_path.split('/')[-1] != '' else file_path.split('/')[-2]
             cached_features_file = os.path.join(
-                file_path, "cached_input_feature_{}_{}{}_{}".format(tokenizer.__class__.__name__, str(block_size), pad_to_max_length_file_prefix, filename+'.pkl',),
+                file_path, "cached_input_feature_for_detection_{}_{}{}_{}".format(tokenizer.__class__.__name__, str(block_size), pad_to_max_length_file_prefix, dir_name+'.pkl',),
             )
 
             with torch_distributed_zero_first(local_rank):
@@ -584,7 +601,7 @@ class CsvDataset(Dataset):
                 if os.path.exists(cached_features_file) and not overwrite_cache:
                     start = time.time()
                     with open(cached_features_file, "rb") as handle:
-                        self.examples, self.labels, self.gold_ids, self.entity_positions = pickle.load(handle)
+                        self.examples = pickle.load(handle)
                     logger.info(
                         f"Loading features from cached file {cached_features_file} [took %.3f s]", time.time() - start
                     )
@@ -596,15 +613,22 @@ class CsvDataset(Dataset):
                     highlight_positions = self.read_tsv(os.path.join(file_path, 'highlight.tsv'))
                     logger.info('Finishing reading tsv files.')
 
+                    self.examples = dict()
+
                     inputs = []
 
                     for i, _ in enumerate(highlight_positions):
                         for j, __ in enumerate(_):
                             __ = __.strip()
+                            if __ == '':
+                                continue
                             temp_sent_1 = ''
                             temp_sent_2 = summaries[i][j]
                             for temp_position in __.split(','):
-                                temp_sent_1 += articles[i][j]
+                                temp_sent_1 += articles[i][int(temp_position)]
+                                # temp_position = temp_position.strip()
+                                # if temp_position != '':
+                                #     temp_sent_1 += articles[i][int(temp_position)]
                             temp_input = self.tokenizer.cls_token + temp_sent_1 + self.tokenizer.sep_token + temp_sent_2 +self.tokenizer.sep_token
                             inputs.append(temp_input)
                     self.examples['input_ids'] = self.tokenizer.batch_encode_plus(
@@ -612,12 +636,77 @@ class CsvDataset(Dataset):
                         add_special_tokens=False,
                         max_length=block_size,
                     )["input_ids"]
+
+                    # input_data include: self.examples
+                    start = time.time()
+                    with open(cached_features_file, "wb") as handle:
+                        pickle.dump(self.examples, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    logger.info(
+                        f"Saving features into cached file %s [took %.3f s]", cached_features_file, time.time() - start
+                    )
         elif description == 'edit':
-            pass
+
+            pad_to_max_length = False
+            pad_to_max_length_file_prefix = ''
+
+            directory, filename = os.path.split(file_path)
+            filename = filename.replace('for_detection_', '')
+            cached_features_file = os.path.join(
+                directory, "cached_input_feature_for_editing_{}_{}{}_{}".format(tokenizer.__class__.__name__, str(block_size), pad_to_max_length_file_prefix, filename+'.pkl',),
+            )
+
+            with torch_distributed_zero_first(local_rank):
+                # Make sure only the first process in distributed training processes the dataset,
+                # and the others will use the cache.
+
+                # load data file
+                if os.path.exists(cached_features_file) and not overwrite_cache:
+                    start = time.time()
+                    with open(cached_features_file, "rb") as handle:
+                        self.examples = pickle.load(handle)
+                    logger.info(
+                        f"Loading features from cached file {cached_features_file} [took %.3f s]", time.time() - start
+                    )
+
+                else:
+                    logger.info("Creating features from dataset file at %s", file_path)
+                    csv_data = self.read_csv(file_path, with_header=False)
+                    logger.info('Finishing reading csv files.')
+
+                    self.examples = dict()
+                    inputs = []
+
+                    for _ in csv_data:
+                        tmp_input = []
+                        for __ in _[1].split():
+                            if __[:2] == '##':
+                                continue
+                            tmp_input.append(__)
+                        inputs.append(' '.join(tmp_input))
+
+                    self.examples['input_ids'] = self.tokenizer.batch_encode_plus(
+                        inputs, 
+                        add_special_tokens=False,
+                        max_length=block_size,
+                    )["input_ids"]
+
+                    # input_data include: self.examples
+                    start = time.time()
+                    with open(cached_features_file, "wb") as handle:
+                        pickle.dump(self.examples, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                    logger.info(
+                        f"Saving features into cached file %s [took %.3f s]", cached_features_file, time.time() - start
+                    )
+
 
     def __len__(self):
         # return len(self.examples)
-        return len(self.classify_data['input_ids'])
+        if self.description in ['train', 'eval']:
+            return len(self.classify_data['input_ids'])
+        elif self.description == 'detect':
+            return len(self.examples["input_ids"])
+        elif self.description == 'edit':
+            return len(self.examples["input_ids"])
 
     def __getitem__(self, i) -> torch.Tensor:
         # return {
@@ -635,60 +724,66 @@ class CsvDataset(Dataset):
                     'tgt_label_ids': torch.tensor(self.insertion_data['tgt_label_ids'][i], dtype=torch.long),
                     'entity_positions': self.insertion_data['entity_positions'][i]
                     }
-        elif self.description is 'detect':
+        elif self.description == 'detect':
             return {
                     "input_ids": torch.tensor(self.examples['input_ids'][i], dtype=torch.long)
                     }
         elif self.description is 'edit':
             return {
-
-            }
+                    "input_ids": torch.tensor(self.examples['input_ids'][i], dtype=torch.long)
+                    }
     
-    def read_csv(self, file_path): 
-        '''
-        return:
-            a list of dict, the keys of dict are headers of the csv file
-        '''
-        header, rst = [], []
-        with open(file_path, 'r') as f: 
-            f_csv = csv.reader(f)
-            for i, _ in enumerate(f_csv): 
-                continue_signal = False
-                if i == 0:
-                    header = _
-                    continue
-                tmp_dict = dict()
-                for j, __ in enumerate(header):
-                    tmp_dict[__] = eval(_[j])
-                    # ['entity' in header] means only_mask.csv
-                    if 'entity' in header:
-                        # classifying samples that have multi-hop entities
-                        if __ == 'entity':
-                            intervals = []
-                            for entity in tmp_dict[__]: 
-                                entity['text'] = ' '.join(entity['text']).replace('\xa0', '[UNK]').split()
-                                for interval in intervals:
-                                    if (entity['position'][0] >= interval[0] and entity['position'][0] <= interval[1]) \
-                                        or (entity['position'][1] >= interval[0] and entity['position'][1] <= interval[1]):
-                                        continue_signal = True
+    def read_csv(self, file_path, with_header=True): 
+        if with_header:
+            '''
+            return:
+                a list of dict, the keys of dict are headers of the csv file
+            '''
+            header, rst = [], []
+            with open(file_path, 'r') as f: 
+                f_csv = csv.reader(f)
+                for i, _ in enumerate(f_csv): 
+                    continue_signal = False
+                    if i == 0:
+                        header = _
+                        continue
+                    tmp_dict = dict()
+                    for j, __ in enumerate(header):
+                        tmp_dict[__] = eval(_[j])
+                        # ['entity' in header] means only_mask.csv
+                        if 'entity' in header:
+                            # classifying samples that have multi-hop entities
+                            if __ == 'entity':
+                                intervals = []
+                                for entity in tmp_dict[__]: 
+                                    entity['text'] = ' '.join(entity['text']).replace('\xa0', '[UNK]').split()
+                                    for interval in intervals:
+                                        if (entity['position'][0] >= interval[0] and entity['position'][0] <= interval[1]) \
+                                            or (entity['position'][1] >= interval[0] and entity['position'][1] <= interval[1]):
+                                            continue_signal = True
+                                            break
+                                    if continue_signal:
                                         break
-                                if continue_signal:
-                                    break
-                                intervals.append([entity['position'][0], entity['position'][1]])
-                        if continue_signal:
-                            break
-                        if __ == 'text': 
-                            # tmp_dict[__].append('[SEP]')
-                            tmp_dict[__] = ' '.join(tmp_dict[__]).replace('\xa0', '[UNK]').split()
-                            sep_position = tmp_dict[__].index('[SEP]')
-                            tmp_dict['text1'] = tmp_dict[__][:sep_position]
-                            tmp_dict['text1'].remove('[CLS]')
-                            tmp_dict['text2'] = tmp_dict[__][sep_position:]
-                            tmp_dict['text2'].remove('[SEP]')
-                        if continue_signal:
-                            continue
-                rst.append(tmp_dict)
-        return rst
+                                    intervals.append([entity['position'][0], entity['position'][1]])
+                            if continue_signal:
+                                break
+                            if __ == 'text': 
+                                # tmp_dict[__].append('[SEP]')
+                                tmp_dict[__] = ' '.join(tmp_dict[__]).replace('\xa0', '[UNK]').split()
+                                sep_position = tmp_dict[__].index('[SEP]')
+                                tmp_dict['text1'] = tmp_dict[__][:sep_position]
+                                tmp_dict['text1'].remove('[CLS]')
+                                tmp_dict['text2'] = tmp_dict[__][sep_position:]
+                                tmp_dict['text2'].remove('[SEP]')
+                            if continue_signal:
+                                continue
+                    rst.append(tmp_dict)
+            return rst
+        else:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                csv_reader = csv.reader(f)
+                result = list(csv_reader)
+            return result
 
     def read_tsv(self, file_path):
         result = []
@@ -711,10 +806,19 @@ class DataCollatorForFactualEditing(DataCollator):
     description: str = 'classify'  # 'classify' or 'insertion'
 
     def collate_batch(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
+        # if key "input_ids" exists, it refers to non-training mode, which means inference mode
         if examples[0].get('input_ids') != None:
             input_ids = [_['input_ids'] for _ in examples]
-            inputs = self._tensorize_batch(input_list=[input_ids])
-            return {"input_ids": inputs}
+            inputs = self._tensorize_batch(input_list=[input_ids])[0]
+            if self.description == 'classify':
+                return {
+                    "input_ids": inputs
+                    }
+            elif self.description == 'insertion':
+                return {
+                    "input_ids": inputs,
+                    "decoder_input_ids": inputs
+                    }
         # input_ids = [_['input_ids'] for _ in examples]
         # mlm_label_ids = [_['mlm_label_ids'] for _ in examples]
         # tgt_ids = [_['tgt_ids'] for _ in examples]
@@ -793,8 +897,12 @@ class DataCollatorForFactualEditing(DataCollator):
                     self, 
                     input_list = None
                     ) -> torch.Tensor:
-        length_of_first = input_list[0][0].size(0)
-        are_tensors_same_length = all(x.size(0) == length_of_first for x in input_list[0])
+        are_tensors_same_length = True
+        for i, _ in enumerate(input_list):
+            length_of_first = input_list[i][0].size(0)
+            are_tensors_same_length = all(x.size(0) == length_of_first for x in input_list[0])
+            if not are_tensors_same_length:
+                break
         if are_tensors_same_length:
             return tuple([torch.stack(_, dim=0) for _ in input_list])
         else:
@@ -907,13 +1015,29 @@ def main():
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
 
-    if model_args.config_name:
-        config = AutoConfig.from_pretrained(model_args.config_name, cache_dir=model_args.cache_dir)
-    elif model_args.model_name_or_path:
-        config = AutoConfig.from_pretrained(model_args.model_name_or_path, cache_dir=model_args.cache_dir)
-    else:
-        config = CONFIG_MAPPING[model_args.model_type]()
-        logger.warning("You are instantiating a new config instance from scratch.")
+    if (not additional_args.do_inference) or (additional_args.classify_or_insertion == 'classify'):
+        if model_args.config_name:
+            config = AutoConfig.from_pretrained(model_args.config_name, cache_dir=model_args.cache_dir)
+        elif model_args.model_name_or_path:
+            config = AutoConfig.from_pretrained(model_args.model_name_or_path, cache_dir=model_args.cache_dir)
+        else:
+            config = CONFIG_MAPPING[model_args.model_type]()
+            logger.warning("You are instantiating a new config instance from scratch.")
+        config_encoder = config
+        config_decoder = config
+
+    # do_inference and is_insertion
+    elif additional_args.classify_or_insertion == 'insertion':
+        if model_args.config_name:
+            config = EncoderDecoderConfig.from_pretrained(model_args.config_name, cache_dir=model_args.cache_dir)
+        elif model_args.model_name_or_path:
+            logger.info("###########################\nLoading predefined EncoderDecoderConfig\n##############################")
+            config = EncoderDecoderConfig.from_pretrained(model_args.model_name_or_path, cache_dir=model_args.cache_dir)
+        else:
+            config = CONFIG_MAPPING[model_args.model_type]()
+            logger.warning("You are instantiating a new config instance from scratch.")
+        config_encoder = config.encoder
+        config_decoder = config.decoder
 
     config.share_bert_param = additional_args.share_bert_param
     config.classify_or_insertion = additional_args.classify_or_insertion
@@ -952,16 +1076,40 @@ def main():
                 cache_dir=model_args.cache_dir,
                 )
         elif additional_args.classify_or_insertion == 'insertion':
-            model = EncoderDecoderInsertionModel.from_encoder_decoder_pretrained(
-                model_args.model_name_or_path, 
-                model_args.model_name_or_path, 
-                encoder_from_tf=bool(".ckpt" in model_args.model_name_or_path), 
-                decoder_from_tf=bool(".ckpt" in model_args.model_name_or_path),
-                encoder_config=config,
-                decoder_config=config, 
-                encoder_cache_dir=model_args.cache_dir,
-                decoder_cache_dir=model_args.cache_dir,
-            )
+            if not additional_args.do_inference:
+                # load original bert-base-uncased
+                model = EncoderDecoderInsertionModel.from_encoder_decoder_pretrained(
+                    model_args.model_name_or_path, 
+                    model_args.model_name_or_path, 
+                    encoder_from_tf=bool(".ckpt" in model_args.model_name_or_path), 
+                    decoder_from_tf=bool(".ckpt" in model_args.model_name_or_path), 
+                )
+            else:
+                encoder_decoder_state_dict = torch.load(os.path.join(model_args.model_name_or_path, "pytorch_model.bin"))
+                encoder_state_dict, decoder_state_dict = dict(), dict()
+                for _ in encoder_decoder_state_dict.keys():
+                    if _[:7] == 'encoder':
+                        tmp_key = _[8:]
+                        encoder_state_dict[tmp_key] = encoder_decoder_state_dict[_]
+                    elif _[:7] == 'decoder':
+                        tmp_key = _[8:]
+                        decoder_state_dict[tmp_key] = encoder_decoder_state_dict[_]
+                    else:
+                        raise KeyError("key \"{}\" doesn't match any model config".format(_))
+                    
+                # load state_dict of my pretrained model for inference
+                model = EncoderDecoderInsertionModel.from_encoder_decoder_pretrained(
+                    model_args.model_name_or_path, 
+                    model_args.model_name_or_path, 
+                    encoder_from_tf=bool(".ckpt" in model_args.model_name_or_path), 
+                    decoder_from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                    encoder_config=config_encoder,
+                    decoder_config=config_decoder, 
+                    encoder_state_dict=encoder_state_dict,
+                    decoder_state_dict=decoder_state_dict,
+                    encoder_cache_dir=model_args.cache_dir,
+                    decoder_cache_dir=model_args.cache_dir,
+                )
     else:
         logger.info("Training new model from scratch")
         if additional_args.classify_or_insertion == 'classify':
@@ -999,7 +1147,7 @@ def main():
         else None
     )
     eval_dataset = (
-        get_dataset(data_args, tokenizer=tokenizer, local_rank=training_args.local_rank, description=='eval')
+        get_dataset(data_args, tokenizer=tokenizer, local_rank=training_args.local_rank, description='eval')
         if training_args.do_eval or training_args.evaluate_during_training
         else None
     )
@@ -1055,18 +1203,44 @@ def main():
     # Inference
     if training_args.do_inference and training_args.local_rank in [-1, 0]:
         logger.info("*** Inference ***")
+        # sequence labeling detection
         if additional_args.classify_or_insertion == 'classify':
-            test_dataset = get_dataset(data_args, tokenizer=tokenizer, local_rank=training_args.local_rank, description=='detect')
-
-        elif additional_args.classify_or_insertion == 'insertion':
-            test_dataset = get_dataset(data_args, tokenizer=tokenizer, local_rank=training_args.local_rank, description=='edit')
+            test_dataset = get_dataset(data_args, tokenizer=tokenizer, local_rank=training_args.local_rank, description='detect')
             inference_output, inference_input = trainer.predict(test_dataset=test_dataset, mode=additional_args.classify_or_insertion)
-            test_file_name = os.path.split(model_args.test_data_file)[1]
-            inference_output_file = os.path.join(training_args.output_dir, 'inference_output_'+test_file_name.split('.')[0]+'.csv')
+            # for classify, test_file_name is a dir 
+            #   (e.g. "test_chen18_org" for 172.16.71.6: /data/senyang/summ_consistence/previous_work/ACL-19_Ranking/summary-correctness-v1.0/test_chen18_org/)
+            test_file_name = data_args.test_data_file.split('/')[-1] if data_args.test_data_file.split('/')[-1] != '' else data_args.test_data_file.split('/')[-2]
+            inference_output_file = os.path.join(training_args.output_dir, 'detection_output_'+test_file_name+'.csv')
+
             with open(inference_output_file, 'w', encoding='utf-8') as f:
                 f_csv = csv.writer(f)
                 for i, _ in enumerate(inference_output):
-                    line = [' ' .join(tokenizer.convert_ids_to_tokens(inference_input[i])), ' '.join(tokenizer.convert_ids_to_tokens(_))]
+                    for j, __ in enumerate(_):
+                        __ = __.tolist()
+                        temp_output = inference_input[i][j].tolist()
+                        temp_del_position = []
+                        for k in range(len(inference_input[i][j])):
+                            if __[k] == 1:
+                                temp_output[k] = START_OF_ENTITY_index
+                            elif __[k] == 2:
+                                temp_del_position.append(k)
+                        temp_del_position.sort(reverse=True)
+                        for k in temp_del_position:
+                            del temp_output[k]
+
+                        line = [tokenizer.decode(inference_input[i][j]), tokenizer.decode(temp_output)]
+                        f_csv.writerow(line)
+
+        # seq2seq insertion editing
+        elif additional_args.classify_or_insertion == 'insertion':
+            test_dataset = get_dataset(data_args, tokenizer=tokenizer, local_rank=training_args.local_rank, description='edit')
+            inference_output, inference_input = trainer.predict(test_dataset=test_dataset, mode=additional_args.classify_or_insertion)
+            test_file_name = os.path.split(data_args.test_data_file)[1]
+            inference_output_file = os.path.join(training_args.output_dir, 'editing_output_'+test_file_name.split('.')[0]+'.csv')
+            with open(inference_output_file, 'w', encoding='utf-8') as f:
+                f_csv = csv.writer(f)
+                for i, _ in enumerate(inference_output):
+                    line = [tokenizer.decode(inference_input[i]), tokenizer.decode(inference_output[i])]
                     f_csv.writerow(line)
 
 
